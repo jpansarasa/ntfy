@@ -36,7 +36,7 @@ die() { echo "install: $*" >&2; exit 1; }
 # would enable units pointing at a tree that isn't the one you just edited.
 [ "$PWD" = /opt/ntfy ] || die "must be installed at /opt/ntfy (found $PWD); the systemd units hardcode that path"
 
-for cmd in docker zfs zpool envsubst systemctl adduser findmnt; do
+for cmd in docker zfs zpool envsubst systemctl adduser findmnt curl; do
     command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available"
@@ -139,13 +139,28 @@ done
 # 4. Render config: template (this dir) + secret (the dataset) -> live mount.
 #    envsubst gets an explicit variable list so ONLY these placeholders are
 #    substituted; every other $-sequence in the upstream template survives.
-#    Rendered to a temp file and moved into place so a failure here can never
-#    leave a truncated server.yml behind. 0640 because it holds a private key.
-#    /usr/bin/install is spelled out: this script is itself named `install`.
+#
+#    Staged at the DATASET ROOT, never inside config/. config/ is bind-mounted
+#    as the container's /etc/ntfy and is owned by uid 2101, so staging there
+#    handed a compromised container a lever on root: a `>` redirect follows
+#    symlinks, so a pre-planted temp name would make root write this file
+#    wherever the link pointed, and swapping the link between render and copy
+#    would splice an arbitrary root-readable file into a container-readable
+#    server.yml. The dataset root is not bind-mounted, so the container cannot
+#    see it, and mktemp creates the file O_EXCL under a random name at 0600 --
+#    no pre-planting, and the private key is never briefly world-readable.
+#
+#    Same filesystem as config/, so the final mv is a rename(2): atomic, and it
+#    replaces a planted destination symlink rather than following it. The old
+#    code claimed this ("moved into place") while actually copying via
+#    /usr/bin/install, which is not atomic.
+render=$(mktemp "$ROOT/.server.yml.XXXXXX")
+trap 'rm -f "$render"' EXIT
 # shellcheck disable=SC2016  # the single quotes are envsubst's variable list, not an expansion
-envsubst '${WEBPUSH_PRIVATE_KEY} ${WEBPUSH_EMAIL} ${NTFY_BASE_URL}' < server.yml.tmpl > "$ROOT/config/.server.yml.new"
-/usr/bin/install -o ntfy -g ntfy -m 0640 "$ROOT/config/.server.yml.new" "$ROOT/config/server.yml"
-rm -f "$ROOT/config/.server.yml.new"
+envsubst '${WEBPUSH_PRIVATE_KEY} ${WEBPUSH_EMAIL} ${NTFY_BASE_URL}' < server.yml.tmpl > "$render"
+chown ntfy:ntfy "$render"
+chmod 0640 "$render"          # 0640: it holds the VAPID private key
+mv -f "$render" "$ROOT/config/server.yml"
 
 # 5. Push target for check-update. It silently no-ops when this file is absent,
 #    so seed a template: a fresh machine then shows an empty NTFY_TOKEN rather
@@ -188,7 +203,30 @@ systemctl daemon-reload
 
 # 9. Apply: (re)start the service (picks up any staged image + config) and
 #    activate the update timer now (it was enabled above).
-systemctl restart ntfy.service
+#
+#    A failed restart is reported rather than left to `set -e`, because the unit
+#    retries on its own: ExecStartPre failures put it in a 30s auto-restart loop,
+#    so "restart returned 1" means "not up YET", not "dead".
+systemctl restart ntfy.service ||
+    die "ntfy.service did not start. It will keep retrying every 30s; the reason is in: journalctl -p err -u ntfy -n 20"
 systemctl start ntfy-update.timer
 
-echo "install: ntfy converged."
+# 10. Smoke test. Until now "converged" meant "systemd accepted the job", which
+#     is not the same as "ntfy is answering" -- a bad value in server.yml.tmpl
+#     renders fine, starts fine, and then crash-loops inside the container. The
+#     most common operation in this repo is edit-template-then-rerun, so that is
+#     exactly the failure this must catch. /v1/health is served without auth
+#     even under auth-default-access: deny-all, so no token is needed here.
+health_url="http://localhost:8123/v1/health"
+for _ in $(seq 60); do
+    if curl -fsS --max-time 2 "$health_url" 2>/dev/null | grep -q '"healthy":true'; then
+        echo "install: ntfy converged and answering on $health_url"
+        exit 0
+    fi
+    sleep 1
+done
+
+die "config applied and the unit started, but ntfy never answered $health_url within 60s.
+  The container is probably crash-looping on a bad server.yml value. Check:
+    docker logs --tail 20 ntfy
+    journalctl -u ntfy -n 30"

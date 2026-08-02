@@ -176,6 +176,13 @@ notice once upstream moves past the release you pinned away from.
 things that already exist. The only side effect of a no-change run is the
 service restart in the final step.
 
+It finishes by polling `/v1/health` until ntfy actually answers, so a zero exit
+means "serving", not merely "systemd accepted the job". That distinction is the
+whole point: a bad value in `server.yml.tmpl` renders cleanly and starts
+cleanly, then crash-loops inside the container. Since editing the template and
+re-running is the most common operation here, that is the failure most likely to
+be introduced — and without the poll it exits 0 and looks like a success.
+
 ## Notes
 
 - The container is unprivileged: `cap_drop: ALL`, then only `CHOWN`/`SETGID`/`SETUID` back, running as uid/gid 2101.
