@@ -3,12 +3,24 @@ Description=ntfy.sh container
 Requires=docker.service
 After=docker.service
 ConditionPathExists=/opt/ntfy/compose.yml
-ConditionPathIsDirectory=/tank/ntfy
+# IsMountPoint, not IsDirectory: an unmounted dataset leaves a bare mountpoint
+# directory behind, which satisfies IsDirectory. Starting there would mean an
+# empty /etc/ntfy, i.e. ntfy on its built-in defaults with no auth-file.
+ConditionPathIsMountPoint=/tank/ntfy
 
 [Service]
 Restart=always
 RestartSec=30
 Environment=DOCKER_UID=2101 DOCKER_GID=2101
+
+# Image tag. latest is the default and the normal state; a bad release is
+# pinned out by writing NTFY_TAG=v2.26.3 into /tank/ntfy/image.env, which
+# systemd applies AFTER Environment= and therefore wins. The leading `-` makes
+# the file optional, so its absence simply means latest. Deleting the file (or
+# the line) un-pins. The pin lives on the dataset, not in git, so it survives a
+# restore and never collides with a pull.
+Environment=NTFY_TAG=latest
+EnvironmentFile=-/tank/ntfy/image.env
 
 # No image pull here: boot/start must be fast and network-order-independent.
 # Updates are fetched out-of-band by ntfy-update.timer and applied on the next

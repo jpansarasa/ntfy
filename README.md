@@ -13,7 +13,7 @@ under systemd.
 | `ntfy.service` | Owns the container. No pull on start, so boot is fast and network-order-independent. |
 | `ntfy-update.service` | Oneshot wrapper around `check-update`. No `[Install]` section — the timer resolves it by name. |
 | `ntfy-update.timer` | Daily update check, off the boot critical path. |
-| `check-update` | Pulls `:latest`, compares to the running image, **stages** (never applies) and pushes a notification. |
+| `check-update` | Pulls the configured tag, compares to the running image, **stages** (never applies) and pushes a notification. |
 
 Paths are pinned: the systemd units hardcode `/opt/ntfy` and `/tank/ntfy`, and
 `install` refuses to run from anywhere else.
@@ -26,6 +26,10 @@ Two root-only files, by design — the repo stays safe to publish:
 | --- | --- | --- |
 | `/tank/ntfy/secrets.env` | `WEBPUSH_PRIVATE_KEY`, `WEBPUSH_EMAIL`, `NTFY_BASE_URL` | You, by hand (see below) |
 | `/tank/ntfy/notify.env` | `NTFY_URL`, `NTFY_TOPIC`, `NTFY_TOKEN` | `install` seeds a template; you fill in the token |
+
+A third, optional and not secret: `/tank/ntfy/image.env`, holding only
+`NTFY_TAG` when a release is pinned (see [Pinning a bad release](#pinning-a-bad-release)).
+Absent in the normal case.
 
 Both live on the ZFS dataset rather than in `/etc` **on purpose**, so that
 whatever backs up the dataset captures them too. That makes the recovery set
@@ -134,6 +138,39 @@ sudo systemctl restart ntfy.service
 # Is an update waiting?
 cat /run/ntfy-update-available
 ```
+
+### Pinning a bad release
+
+The normal state is `:latest`, and the normal response to a new release is to
+take it — upstream releases are far more often fixes than regressions. So
+`latest` is the default, and pinning is the exception, kept to one file that is
+not in git:
+
+```bash
+# Which version am I on, and which have I run before? (the container logs it
+# at startup, and the unit runs attached, so the journal has the whole history)
+docker logs ntfy | head -1
+journalctl -u ntfy.service | grep -oE 'ntfy [0-9]+\.[0-9]+\.[0-9]+' | uniq
+
+# Pin, then apply
+sudo sh -c 'echo NTFY_TAG=v2.26.3 > /tank/ntfy/image.env'
+sudo systemctl restart ntfy.service
+
+# Un-pin once upstream supersedes the bad release
+sudo rm /tank/ntfy/image.env
+sudo systemctl restart ntfy.service
+```
+
+`ntfy.service` sets `NTFY_TAG=latest` and then reads `/tank/ntfy/image.env`,
+which systemd applies **after** `Environment=` and therefore wins; the `-`
+prefix makes the file optional, so its absence just means `latest`. The pin
+lives on the dataset rather than in git so it survives a restore and never
+collides with a `git pull`.
+
+While pinned, `check-update` tracks the **pinned** tag — it will not claim an
+update is staged that a restart would not actually apply. It still watches
+`:latest` separately and pushes a one-line "the pin can likely be retired"
+notice once upstream moves past the release you pinned away from.
 
 `install` is safe to run repeatedly; it converges rather than erroring on
 things that already exist. The only side effect of a no-change run is the

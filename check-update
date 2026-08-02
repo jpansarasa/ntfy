@@ -15,7 +15,18 @@ set -euo pipefail
 
 export DOCKER_UID="${DOCKER_UID:-2101}" DOCKER_GID="${DOCKER_GID:-2101}"
 
-IMAGE=docker.io/binwiederhier/ntfy:latest
+# Track whatever tag ntfy.service would actually start, or this reports on an
+# image a restart would never run. The units pass NTFY_TAG in; a by-hand run
+# gets it from the same pin file they use, then falls back to the same default.
+# (`if` rather than `[ -r ] && .` -- the latter returns 1 when absent and would
+# trip set -e.)
+if [ -r /tank/ntfy/image.env ]; then
+    # shellcheck source=/dev/null
+    . /tank/ntfy/image.env
+fi
+export NTFY_TAG="${NTFY_TAG:-latest}"
+
+IMAGE="docker.io/binwiederhier/ntfy:${NTFY_TAG}"
 MARKER=/run/ntfy-update-available
 COMPOSE=(/usr/bin/docker compose --file /opt/ntfy/compose.yml --project-name ntfy)
 NOTIFY_ENV=/tank/ntfy/notify.env
@@ -68,4 +79,19 @@ if [ "$running" != "$latest" ]; then
 fi
 
 rm -f "$MARKER"
-echo "ntfy already running the latest image ($latest)."
+echo "ntfy already running the current $NTFY_TAG image ($latest)."
+
+# Pinned: the running image matches the pin, so nothing is staged and nothing
+# above fired. A pin is meant to be temporary, though, so report when upstream
+# moves -- that is the signal the bad release was superseded and the pin can go.
+# Deliberately NOT written to $MARKER: a restart applies none of this.
+if [ "$NTFY_TAG" != latest ]; then
+    docker pull --quiet docker.io/binwiederhier/ntfy:latest >/dev/null 2>&1 || true
+    upstream=$(docker image inspect --format '{{.Id}}' docker.io/binwiederhier/ntfy:latest 2>/dev/null || true)
+    if [ -n "$upstream" ] && [ "$upstream" != "$running" ]; then
+        echo "note: pinned to $NTFY_TAG; upstream :latest has moved ($upstream)."
+        echo "      un-pin by removing NTFY_TAG from /tank/ntfy/image.env, then restart."
+        notify "ntfy pin can likely be retired" "pushpin,ntfy" \
+            "Pinned to $NTFY_TAG; upstream :latest has moved. Un-pin: remove NTFY_TAG from /tank/ntfy/image.env, then sudo systemctl restart ntfy.service"
+    fi
+fi

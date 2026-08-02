@@ -36,15 +36,30 @@ die() { echo "install: $*" >&2; exit 1; }
 # would enable units pointing at a tree that isn't the one you just edited.
 [ "$PWD" = /opt/ntfy ] || die "must be installed at /opt/ntfy (found $PWD); the systemd units hardcode that path"
 
-for cmd in docker zfs zpool envsubst systemctl adduser; do
+for cmd in docker zfs zpool envsubst systemctl adduser findmnt; do
     command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available"
 zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
 
-# 1. Service user (uid/gid 2101, matches DOCKER_UID/DOCKER_GID in ntfy.service)
+# 1. Service user (uid/gid 2101, matches DOCKER_UID/DOCKER_GID in ntfy.service).
+#    The uid is deliberately outside every allocator's range (system 100-999 is
+#    filled by package postinsts in install order, human uids count up from
+#    1000, lxd subuids start at 100000) so the same number is free on any
+#    rebuilt machine -- file ownership on the dataset has to survive a restore.
+#
+#    The getent guard is load-bearing, not idempotency sugar: adduser's
+#    "already exists -> exit 0" path applies only to uids INSIDE the system
+#    range, so for this out-of-range uid a bare re-run of adduser would die
+#    ("exists, but is not a system user") and take this script with it.
 if ! getent passwd ntfy >/dev/null; then
     adduser --system --group --uid "$SVC_UID" ntfy
+fi
+# Existence isn't enough: an ntfy user at any other uid/gid would make the
+# chown below converge the tree to an owner the container (hardcoded 2101 in
+# ntfy.service) doesn't run as.
+if [ "$(id -u ntfy)" != "$SVC_UID" ] || [ "$(id -g ntfy)" != "$SVC_UID" ]; then
+    die "user ntfy is uid=$(id -u ntfy) gid=$(id -g ntfy), expected $SVC_UID:$SVC_UID (see ntfy.service, compose.yml)"
 fi
 
 # 2. ZFS dataset + the bind-mount subdirs the compose volumes expect.
@@ -63,6 +78,25 @@ if ! zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
         zfs-auto-snapshot --label=monthly --keep=12 "$DATASET"
     fi
 fi
+
+#    Existing is not the same as mounted, and the difference is dangerous: the
+#    `zfs list` above succeeds for an unmounted dataset, and the mkdir below
+#    would then create the compose bind sources in the BARE MOUNTPOINT on the
+#    parent filesystem. Those directories are the only thing standing between
+#    an unmounted dataset and a wide-open server: compose's named volumes
+#    (type:none, o:bind) fail container start when the source is missing, but
+#    once mkdir supplies them the container starts on an empty /etc/ntfy, which
+#    means ntfy's built-in defaults -- no auth-file, default access read-write.
+#    The server would come up healthy-looking and unauthenticated while the real
+#    config and user.db sat hidden under the unmounted dataset, and the next
+#    mount would silently shadow whatever had been written in the meantime.
+#
+#    findmnt answers both halves at once: $ROOT is a mountpoint, and what is
+#    mounted there is our dataset (not the parent fs, not something else).
+if [ "$(findmnt -no SOURCE "$ROOT" 2>/dev/null)" != "$DATASET" ]; then
+    die "$ROOT is not a mount of $DATASET -- refusing to create bind sources in a bare mountpoint (try: zfs mount $DATASET)"
+fi
+
 mkdir -p "$ROOT/auth" "$ROOT/cache" "$ROOT/config"
 
 # 3. Secrets. Deliberately checked AFTER the dataset exists: ZFS mounts over a
@@ -77,7 +111,8 @@ install: missing $SECRETS
   On a rebuild this arrives with the replicated $DATASET dataset --
   restore that and re-run.
 
-  To create it from scratch instead ($ROOT now exists, this run created it):
+  To create it from scratch instead ($ROOT exists and is the mounted
+  $DATASET dataset, checked above, so the file lands inside it):
 
     sudo sh -c 'umask 077; cat > $SECRETS' <<'VARS'
     WEBPUSH_PRIVATE_KEY=<key matching web-push-public-key in server.yml.tmpl>

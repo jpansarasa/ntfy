@@ -3,8 +3,16 @@ name: ntfy
 services:
   ntfy:
     container_name: ntfy
-    image: docker.io/binwiederhier/ntfy:latest
-    restart: unless-stopped
+    # Tag comes from the environment so a bad :latest can be pinned out without
+    # editing this file. The units set NTFY_TAG=latest and let
+    # /tank/ntfy/image.env override it; the default here covers by-hand runs.
+    image: docker.io/binwiederhier/ntfy:${NTFY_TAG:-latest}
+    # Deliberately NO restart policy: systemd is the only supervisor.
+    # With one here, dockerd restarts the container behind ntfy.service's back --
+    # the attached `compose up` never exits, so a crash-loop leaves the unit
+    # green, Restart=always dead code, and the outage invisible. Without one, a
+    # container exit ends `compose up`, and systemd restarts it in the journal
+    # where you can see it.
     user: "${DOCKER_UID}:${DOCKER_GID}"
     cpus: '0.50'
     mem_limit: 500M
