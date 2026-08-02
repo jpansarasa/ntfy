@@ -180,3 +180,31 @@ service restart in the final step.
 
 - The container is unprivileged: `cap_drop: ALL`, then only `CHOWN`/`SETGID`/`SETUID` back, running as uid/gid 2101.
 - `ntfy.service` deliberately does **not** pull on start. Pulling is the update timer's job; a start that waits on the network makes boot order fragile.
+
+### Waiting, not skipping
+
+Every prerequisite that can be *late* — the ZFS dataset, the rendered config,
+dockerd — is checked in a way that **fails and retries**, never one that skips.
+That is a deliberate choice, and the reasoning is worth keeping:
+
+`Condition*` directives (and `Assert*`, and a failed `Requires=`) abort the
+start *job*. The unit never enters start, so `Restart=` is never armed, the unit
+sits at `inactive (dead)` with `Result=success`, and **nothing ever
+re-evaluates**. Repairing the prerequisite does not bring it back — only a new
+start job does. For the box that carries your alerts, that is the worst failure
+shape there is: silent, absent from `systemctl --failed`, and permanent.
+
+So the dataset and config checks are `ExecStartPre=` (a real start failure, which
+`Restart=always` retries every 30s, re-running the check each cycle), docker is
+`Wants=` rather than `Requires=`, and `StartLimitIntervalSec=0` means it never
+gives up. A late pool import, a hand `zfs mount`, or a dockerd that comes back
+all recover the service unattended within 30 seconds.
+
+The cost, which you need to know when looking for a sick service: a unit that
+retries forever never reaches `failed`, so **`systemctl --failed` stays empty
+while ntfy is down**. Look instead at:
+
+```bash
+systemctl is-active ntfy            # "activating" (not "active") while stuck
+journalctl -p err -u ntfy -n 20     # the guards log why, at priority err, every cycle
+```

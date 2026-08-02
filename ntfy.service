@@ -1,12 +1,40 @@
 [Unit]
 Description=ntfy.sh container
-Requires=docker.service
+
+# Wants=, NOT Requires=. Both gate on docker, but they fail in opposite ways.
+# A failed Requires= dependency aborts the START JOB: the unit never enters
+# start, so Restart= is never armed, and it sits at inactive/dead with
+# Result=success -- absent from `systemctl --failed`, and NOT revived when
+# docker is repaired, because nothing re-enqueues a start job. That matters
+# here: docker.service is StartLimitBurst=3/StartLimitIntervalSec=60, so a boot
+# where containerd or the firewall races dockerd makes docker give up for good
+# in ~4s, and this unit would follow it into a silent grave.
+# With Wants=, a dead dockerd instead fails ExecStart, which DOES arm
+# Restart=always -- so it retries every 30s and recovers on its own once docker
+# is back. Same "fail, don't skip" rule as the guards below.
+Wants=docker.service
 After=docker.service
+
+# Ordering only, and deliberately no RequiresMountsFor=/tank/ntfy. On this host
+# tank-ntfy.mount is synthesized from /proc/self/mountinfo with no fragment, so
+# RequiresMountsFor yields ordering and no requirement -- but that is an
+# accident of configuration: enabling zfs-mount-generator gives the mount unit a
+# fragment, at which point it silently becomes a Requires= edge and inherits the
+# exact start-job wedge described above. The dataset is gated by ExecStartPre
+# instead, which retries. After= can never wedge a unit, so it is safe to keep.
+After=zfs-mount.service
+
+# A Condition is right HERE and wrong for the dataset. /opt is on the root
+# filesystem, so this path cannot arrive late; its absence means the install is
+# gone, which is a human action, not a transient fault. Skip-and-stay-quiet is
+# the correct semantic for that. It is the wrong semantic four lines down, which
+# is the whole lesson: Condition* answers "should I bother?", not "am I ready?".
 ConditionPathExists=/opt/ntfy/compose.yml
-# IsMountPoint, not IsDirectory: an unmounted dataset leaves a bare mountpoint
-# directory behind, which satisfies IsDirectory. Starting there would mean an
-# empty /etc/ntfy, i.e. ntfy on its built-in defaults with no auth-file.
-ConditionPathIsMountPoint=/tank/ntfy
+
+# Never stop retrying. At RestartSec=30 the default limit (5 starts / 10s) is
+# already unreachable, so this makes the guarantee structural instead of
+# arithmetic and survives someone lowering RestartSec later.
+StartLimitIntervalSec=0
 
 [Service]
 Restart=always
@@ -21,6 +49,26 @@ Environment=DOCKER_UID=2101 DOCKER_GID=2101
 # restore and never collides with a pull.
 Environment=NTFY_TAG=latest
 EnvironmentFile=-/tank/ntfy/image.env
+
+# The dataset guard. This replaces ConditionPathIsMountPoint=/tank/ntfy, which
+# SKIPPED instead of failing: the unit never started, Restart= was never armed,
+# nothing re-evaluated it, and a late pool import left ntfy -- this host's alert
+# channel -- silently dead with one journal line as the only trace. A failing
+# ExecStartPre is a real start failure, so Restart=always retries it every 30s
+# forever, re-running this check each cycle; a `zfs mount tank/ntfy` therefore
+# recovers the service unattended within one RestartSec.
+#
+# --type/--source are load-bearing, not decoration: a bare mountpoint test also
+# passes when something ELSE is mounted there, and reads only
+# /proc/self/mountinfo, so it cannot block on a faulted pool.
+ExecStartPre=/bin/sh -c '/usr/bin/findmnt --type zfs --source tank/ntfy --mountpoint /tank/ntfy --noheadings --output SOURCE,TARGET || { echo "<3>ntfy: tank/ntfy is NOT mounted at /tank/ntfy -- refusing to start, because an unmounted dataset leaves a bare directory that would run ntfy on built-in defaults with auth DISABLED. Retrying every 30s."; exit 1; }'
+
+# Mounted but empty is the same hazard: server.yml is what enables auth, and a
+# half-finished restore would otherwise start wide open. Unlike the check above
+# this one stat()s the dataset, which blocks indefinitely on a faulted pool
+# (tank is failmode=wait), so it is bounded -- an unkillable D-state process
+# would otherwise leak into the cgroup on every retry.
+ExecStartPre=/usr/bin/timeout 10 /bin/sh -c 'test -s /tank/ntfy/config/server.yml || { echo "<3>ntfy: /tank/ntfy/config/server.yml is missing or empty -- refusing to start without the config that enables auth. Retrying every 30s."; exit 1; }'
 
 # No image pull here: boot/start must be fast and network-order-independent.
 # Updates are fetched out-of-band by ntfy-update.timer and applied on the next
