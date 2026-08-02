@@ -1,0 +1,12 @@
+[Unit]
+Description=ntfy image update check (fetch :latest, notify if newer than running)
+Documentation=file:/opt/ntfy/check-update
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/ntfy/compose.yml
+
+[Service]
+Type=oneshot
+Environment=DOCKER_UID=2101 DOCKER_GID=2101
+ExecStart=/opt/ntfy/check-update

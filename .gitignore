@@ -1,0 +1,13 @@
+# Rendered output, not source. The live copy lives at /tank/ntfy/config/server.yml
+# and contains the VAPID private key. Source of truth is server.yml.tmpl.
+server.yml
+
+# Stale/unused VAPID keypair. Superseded by server.yml.tmpl + /tank/ntfy/secrets.env.
+vapid.json
+
+# Local cruft from in-place editing on the host.
+*.bak
+*.save
+*.log
+*.orig
+*.new

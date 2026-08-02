@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# Idempotent (re)install / redeploy for the ntfy service.
+#
+# Safe to run repeatedly: every run converges to the desired state and does not
+# error on things that already exist. Config is rendered FROM this directory
+# (the source of truth) TO the live bind-mount at /tank/ntfy.
+#
+# Secrets are NOT in this repo. server.yml is rendered from server.yml.tmpl
+# using /tank/ntfy/secrets.env, which is root-only and lives on the replicated
+# dataset rather than in /etc, so that restoring the dataset restores it too.
+# It must exist before the first run (this script prints exactly what it wants).
+#
+# NOTE: the last step restarts ntfy, briefly dropping active subscriptions.
+#
+set -euo pipefail
+
+# Always operate relative to this script's own directory, wherever it's run from.
+cd "$(dirname "$(readlink -f "$0")")"
+
+ROOT=/tank/ntfy
+DATASET=tank/ntfy
+SVC_UID=2101
+# Both live on the dataset rather than in /etc, so that whatever backs up the
+# dataset also captures them and a restore brings the service back whole.
+SECRETS="$ROOT/secrets.env"
+NOTIFY_ENV="$ROOT/notify.env"
+
+die() { echo "install: $*" >&2; exit 1; }
+
+# 0. Preconditions. Fail loudly and early rather than half-converging: a run
+#    that dies at step 5 leaves a live service with a half-applied config.
+[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo ./install)"
+
+# The systemd units hardcode /opt/ntfy and /tank/ntfy. A clone anywhere else
+# would enable units pointing at a tree that isn't the one you just edited.
+[ "$PWD" = /opt/ntfy ] || die "must be installed at /opt/ntfy (found $PWD); the systemd units hardcode that path"
+
+for cmd in docker zfs zpool envsubst systemctl adduser; do
+    command -v "$cmd" >/dev/null || die "missing required command: $cmd"
+done
+docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available"
+zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
+
+# 1. Service user (uid/gid 2101, matches DOCKER_UID/DOCKER_GID in ntfy.service)
+if ! getent passwd ntfy >/dev/null; then
+    adduser --system --group --uid "$SVC_UID" ntfy
+fi
+
+# 2. ZFS dataset + the bind-mount subdirs the compose volumes expect.
+#
+#    A dataset created from scratch here is opted into zfs-auto-snapshot and
+#    given a first snapshot, so snapshot-based backup tooling has something to
+#    work from immediately.
+#
+#    This runs ONLY on creation, deliberately. On a restore the property
+#    arrives with the received dataset, and if the dataset is ever opted out
+#    on purpose, a later install must not silently opt it back in.
+if ! zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
+    zfs create -p "$DATASET"
+    zfs set com.sun:auto-snapshot:monthly=true "$DATASET"
+    if command -v zfs-auto-snapshot >/dev/null; then
+        zfs-auto-snapshot --label=monthly --keep=12 "$DATASET"
+    fi
+fi
+mkdir -p "$ROOT/auth" "$ROOT/cache" "$ROOT/config"
+
+# 3. Secrets. Deliberately checked AFTER the dataset exists: ZFS mounts over a
+#    non-empty directory (overlay defaults to on), so a secrets file written
+#    into the mountpoint before the dataset was created would be silently
+#    shadowed the moment it mounts -- present to the writer, invisible here.
+#    Creating the dataset first means the file always lands inside it.
+if [ ! -r "$SECRETS" ]; then
+    cat >&2 <<EOF
+install: missing $SECRETS
+
+  On a rebuild this arrives with the replicated $DATASET dataset --
+  restore that and re-run.
+
+  To create it from scratch instead ($ROOT now exists, this run created it):
+
+    sudo sh -c 'umask 077; cat > $SECRETS' <<'VARS'
+    WEBPUSH_PRIVATE_KEY=<key matching web-push-public-key in server.yml.tmpl>
+    WEBPUSH_EMAIL=<contact address reported to the push provider>
+    NTFY_BASE_URL=<https://ntfy.example.com>
+    VARS
+
+  To generate a fresh keypair (this invalidates every existing browser
+  web-push subscription, and you must also update the public key in
+  server.yml.tmpl):
+
+    docker run --rm binwiederhier/ntfy:latest webpush keys
+EOF
+    exit 1
+fi
+set -a
+# shellcheck source=/dev/null
+. "$SECRETS"
+set +a
+for var in WEBPUSH_PRIVATE_KEY WEBPUSH_EMAIL NTFY_BASE_URL; do
+    [ -n "$(eval "printf '%s' \"\${$var:-}\"")" ] || die "$var is unset or empty in $SECRETS"
+done
+
+# 4. Render config: template (this dir) + secret (the dataset) -> live mount.
+#    envsubst gets an explicit variable list so ONLY these placeholders are
+#    substituted; every other $-sequence in the upstream template survives.
+#    Rendered to a temp file and moved into place so a failure here can never
+#    leave a truncated server.yml behind. 0640 because it holds a private key.
+#    /usr/bin/install is spelled out: this script is itself named `install`.
+# shellcheck disable=SC2016  # the single quotes are envsubst's variable list, not an expansion
+envsubst '${WEBPUSH_PRIVATE_KEY} ${WEBPUSH_EMAIL} ${NTFY_BASE_URL}' < server.yml.tmpl > "$ROOT/config/.server.yml.new"
+/usr/bin/install -o ntfy -g ntfy -m 0640 "$ROOT/config/.server.yml.new" "$ROOT/config/server.yml"
+rm -f "$ROOT/config/.server.yml.new"
+
+# 5. Push target for check-update. It silently no-ops when this file is absent,
+#    so seed a template: a fresh machine then shows an empty NTFY_TOKEN rather
+#    than quietly never notifying. Never overwrites an existing (real) one.
+if [ ! -e "$NOTIFY_ENV" ]; then
+    (umask 077; cat > "$NOTIFY_ENV" <<'EOF'
+# Push target for /opt/ntfy/check-update. Root-only, deliberately NOT in git.
+# Lives on the replicated dataset so a rebuild recovers it with the data.
+# The update push is skipped entirely while NTFY_TOKEN is empty.
+NTFY_URL=http://localhost:8123
+NTFY_TOPIC=updates
+NTFY_TOKEN=
+EOF
+    )
+    echo "install: wrote template $NOTIFY_ENV -- set NTFY_TOKEN to enable update pushes" >&2
+fi
+
+# 6. Ownership (belt-and-suspenders; the container runs as uid 2101), then
+#    re-assert root-only on the two credential files the sweep just touched.
+#    They sit at the dataset root, which compose does not bind-mount (only the
+#    config/, cache/ and auth/ subdirs are), so the container never sees them.
+chown -R ntfy:ntfy "$ROOT"
+chown root:root "$SECRETS" "$NOTIFY_ENV"
+chmod 0600 "$SECRETS" "$NOTIFY_ENV"
+
+# 7. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
+#    pulls on start (updates come from ntfy-update.timer). Safe if already gone.
+rm -f /etc/systemd/system/ntfy.service.d/pull-not-on-boot.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/ntfy.service.d 2>/dev/null || true
+
+# 8. Register units (idempotent). `enable` installs the /opt symlink for the
+#    main service and the timer; the oneshot update service has no [Install]
+#    section, so it is `link`ed instead so the timer can resolve it by name.
+systemctl enable "$PWD/ntfy.service"
+if ! systemctl cat ntfy-update.service >/dev/null 2>&1; then
+    systemctl link "$PWD/ntfy-update.service"
+fi
+systemctl enable "$PWD/ntfy-update.timer"
+systemctl daemon-reload
+
+# 9. Apply: (re)start the service (picks up any staged image + config) and
+#    activate the update timer now (it was enabled above).
+systemctl restart ntfy.service
+systemctl start ntfy-update.timer
+
+echo "install: ntfy converged."

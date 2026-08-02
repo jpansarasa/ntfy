@@ -1,0 +1,53 @@
+name: ntfy
+
+services:
+  ntfy:
+    container_name: ntfy
+    image: docker.io/binwiederhier/ntfy:latest
+    restart: unless-stopped
+    user: "${DOCKER_UID}:${DOCKER_GID}"
+    cpus: '0.50'
+    mem_limit: 500M
+    mem_reservation: 15M
+    ports:
+      - 8123:80
+    volumes:
+      - config:/etc/ntfy
+      - cache:/var/cache/ntfy
+      - auth:/var/lib/ntfy
+    environment:
+      - TZ=America/New_York
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    command:
+      - serve
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://0.0.0.0 || exit 1"]
+      interval: 1m30s
+      timeout: 5s
+      start_period: 30s
+      start_interval: 5s
+      retries: 3
+volumes:
+  cache:
+    driver: local
+    driver_opts:
+      device: /tank/ntfy/cache
+      o: bind
+      type: none
+  config:
+    driver: local
+    driver_opts:
+      device: /tank/ntfy/config
+      o: bind
+      type: none
+  auth:
+    driver: local
+    driver_opts:
+      device: /tank/ntfy/auth
+      o: bind
+      type: none

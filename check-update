@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+# ntfy image update check (fetch + notify, does NOT apply).
+#
+# Pulls docker.io/binwiederhier/ntfy:latest and compares it to the image the
+# running container is actually using. If they differ, an update is "staged":
+# it is flagged (systemd journal + a marker file) but the container is left
+# running the old image. Apply a staged update with:
+#     sudo systemctl restart ntfy.service
+# A reboot also applies it (the service's `up` uses the already-pulled image).
+#
+# Run by ntfy-update.timer; safe to run by hand.
+#
+set -euo pipefail
+
+export DOCKER_UID="${DOCKER_UID:-2101}" DOCKER_GID="${DOCKER_GID:-2101}"
+
+IMAGE=docker.io/binwiederhier/ntfy:latest
+MARKER=/run/ntfy-update-available
+COMPOSE=(/usr/bin/docker compose --file /opt/ntfy/compose.yml --project-name ntfy)
+NOTIFY_ENV=/tank/ntfy/notify.env
+
+# Best-effort ntfy push; never fails the check. Args: title, tags, body.
+# Silently no-ops if the (root-only) notify env / token is absent.
+notify() {
+    [ -r "$NOTIFY_ENV" ] || return 0
+    # shellcheck source=/dev/null
+    . "$NOTIFY_ENV"
+    [ -n "${NTFY_TOKEN:-}" ] || return 0
+    curl -fsS --max-time 10 \
+        -H "Authorization: Bearer ${NTFY_TOKEN}" \
+        -H "Title: ${1}" \
+        -H "Tags: ${2}" \
+        -d "${3}" \
+        "${NTFY_URL:-http://localhost:8123}/${NTFY_TOPIC:-updates}" >/dev/null 2>&1 || true
+}
+
+# Fetch the latest tag. This updates the local :latest pointer only; it does
+# NOT touch the running container.
+"${COMPOSE[@]}" pull --quiet
+
+# $() strips the trailing newline; a failed inspect yields "" -> defaulted to
+# "none". (Avoid `|| echo none`, which can leave a stray blank line in the value.)
+running=$(docker inspect --format '{{.Image}}' ntfy 2>/dev/null || true)
+latest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)
+running=${running:-none}
+latest=${latest:-none}
+
+# If the container isn't running, `docker inspect` yields "none", which would
+# otherwise look identical to "a newer image is staged" and fire a spurious
+# "update available" push (e.g. during a restart/maintenance window). Skip.
+if [ "$running" = "none" ]; then
+    echo "ntfy container not running; skipping update check." >&2
+    exit 0
+fi
+
+if [ "$running" != "$latest" ]; then
+    {
+        echo "ntfy update staged (not applied)."
+        echo "running: $running"
+        echo "latest:  $latest"
+        echo "checked: $(date -Is)"
+        echo "Apply:   sudo systemctl restart ntfy.service"
+    } | tee "$MARKER" >&2
+    notify "ntfy update available" "package,ntfy" \
+        "New :latest image staged. Apply: sudo systemctl restart ntfy.service"
+    exit 0
+fi
+
+rm -f "$MARKER"
+echo "ntfy already running the latest image ($latest)."

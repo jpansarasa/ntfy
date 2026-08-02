@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily ntfy image update check
+
+[Timer]
+# Off the boot critical path; fires after boot completes.
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target
