@@ -31,6 +31,23 @@ A third, optional and not secret: `/tank/ntfy/image.env`, holding only
 `NTFY_TAG` when a release is pinned (see [Pinning a bad release](#pinning-a-bad-release)).
 Absent in the normal case.
 
+`install` renders that pin to **`/etc/ntfy/image.env`**, and the generated copy
+is the only one systemd and `check-update` read. Do not edit it; it is rewritten
+on every run. The reason is measured rather than assumed: systemd reads
+`EnvironmentFile=` in **PID 1 itself**, and `tank` is `failmode=wait`, so an
+`EnvironmentFile=` pointing at the pool lets a fault put PID 1 into
+uninterruptible sleep — no `systemctl`, no logins, no clean shutdown — with the
+`ExecStartPre` guards written for exactly that outage sitting unreachable behind
+it. On the box that carries your alerts that is the worst possible way to lose
+it. The source of truth stays on the dataset, where it travels with the pool;
+only the render lives on the disposable OS drive.
+
+The render also **filters** to `NTFY_TAG` alone. systemd applies
+`EnvironmentFile=` *after* `Environment=`, so anything else in the source file
+would win — `DOCKER_UID=0` most pointedly, which puts the container back to
+running as root, the one state in which it can read `secrets.env` by ownership
+alone.
+
 Both live on the ZFS dataset rather than in `/etc` **on purpose**, so that
 whatever backs up the dataset captures them too. That makes the recovery set
 exactly two things:
@@ -152,20 +169,22 @@ not in git:
 docker logs ntfy | head -1
 journalctl -u ntfy.service | grep -oE 'ntfy [0-9]+\.[0-9]+\.[0-9]+' | uniq
 
-# Pin, then apply
+# Pin, then apply. install re-renders /etc/ntfy/image.env and restarts.
 sudo sh -c 'echo NTFY_TAG=v2.26.3 > /tank/ntfy/image.env'
-sudo systemctl restart ntfy.service
+sudo /opt/ntfy/install
 
 # Un-pin once upstream supersedes the bad release
 sudo rm /tank/ntfy/image.env
-sudo systemctl restart ntfy.service
+sudo /opt/ntfy/install
 ```
 
-`ntfy.service` sets `NTFY_TAG=latest` and then reads `/tank/ntfy/image.env`,
-which systemd applies **after** `Environment=` and therefore wins; the `-`
-prefix makes the file optional, so its absence just means `latest`. The pin
-lives on the dataset rather than in git so it survives a restore and never
-collides with a `git pull`.
+`ntfy.service` sets `NTFY_TAG=latest` and then reads the rendered
+`/etc/ntfy/image.env`, which systemd applies **after** `Environment=` and
+therefore wins. The pin source lives on the dataset rather than in git, so it
+survives a restore, travels with the pool, and never collides with a `git pull`.
+Because the value reaches systemd through a render, pinning is an edit plus
+`install` rather than an edit plus `restart` — the same way every other change
+in this repo is applied.
 
 While pinned, `check-update` tracks the **pinned** tag — it will not claim an
 update is staged that a restart would not actually apply. It still watches

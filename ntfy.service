@@ -42,13 +42,18 @@ RestartSec=30
 Environment=DOCKER_UID=2101 DOCKER_GID=2101
 
 # Image tag. latest is the default and the normal state; a bad release is
-# pinned out by writing NTFY_TAG=v2.26.3 into /tank/ntfy/image.env, which
-# systemd applies AFTER Environment= and therefore wins. The leading `-` makes
-# the file optional, so its absence simply means latest. Deleting the file (or
-# the line) un-pins. The pin lives on the dataset, not in git, so it survives a
-# restore and never collides with a pull.
+# pinned out by writing NTFY_TAG=v2.26.3 into /tank/ntfy/image.env and re-running
+# install, which renders the value here. The pin SOURCE lives on the dataset, not
+# in git, so it survives a restore, travels with the pool and never collides with
+# a pull; this file is a generated copy.
+#
+# It is a copy because systemd reads EnvironmentFile in PID 1 ITSELF (measured:
+# strace of pid 1 shows it opening the file during a restart), and tank is
+# failmode=wait -- so pointing this at the pool would let a fault wedge PID 1,
+# taking systemctl, logins and clean shutdown with it, with the ExecStartPre
+# guards below sitting unreachable behind it.
 Environment=NTFY_TAG=latest
-EnvironmentFile=-/tank/ntfy/image.env
+EnvironmentFile=-/etc/ntfy/image.env
 
 # The dataset guard. This replaces ConditionPathIsMountPoint=/tank/ntfy, which
 # SKIPPED instead of failing: the unit never started, Restart= was never armed,

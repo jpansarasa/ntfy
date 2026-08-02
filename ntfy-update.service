@@ -12,5 +12,5 @@ Environment=DOCKER_UID=2101 DOCKER_GID=2101
 # Must agree with ntfy.service, or the checker reports on a different image
 # than the one a restart would actually run. See that unit for the pin story.
 Environment=NTFY_TAG=latest
-EnvironmentFile=-/tank/ntfy/image.env
+EnvironmentFile=-/etc/ntfy/image.env
 ExecStart=/opt/ntfy/check-update

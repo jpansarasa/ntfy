@@ -20,9 +20,12 @@ export DOCKER_UID="${DOCKER_UID:-2101}" DOCKER_GID="${DOCKER_GID:-2101}"
 # gets it from the same pin file they use, then falls back to the same default.
 # (`if` rather than `[ -r ] && .` -- the latter returns 1 when absent and would
 # trip set -e.)
-if [ -r /tank/ntfy/image.env ]; then
-    # shellcheck source=/dev/null
-    . /tank/ntfy/image.env
+# Reads the RENDERED copy, the same file the units read, so this can never
+# report on a different tag than a restart would apply. Parsed, never sourced.
+if [ -r /etc/ntfy/image.env ]; then
+    tag=$(grep -m1 -oP '^NTFY_TAG=\K.*' /etc/ntfy/image.env 2>/dev/null || true)
+    tag=${tag%$'\r'}; tag=${tag#\"}; tag=${tag%\"}
+    [ -n "$tag" ] && NTFY_TAG="$tag"
 fi
 export NTFY_TAG="${NTFY_TAG:-latest}"
 
@@ -33,18 +36,38 @@ NOTIFY_ENV=/tank/ntfy/notify.env
 
 # Best-effort ntfy push; never fails the check. Args: title, tags, body.
 # Silently no-ops if the (root-only) notify env / token is absent.
-notify() {
-    [ -r "$NOTIFY_ENV" ] || return 0
-    # shellcheck source=/dev/null
-    . "$NOTIFY_ENV"
-    [ -n "${NTFY_TOKEN:-}" ] || return 0
-    curl -fsS --max-time 10 \
-        -H "Authorization: Bearer ${NTFY_TOKEN}" \
-        -H "Title: ${1}" \
-        -H "Tags: ${2}" \
-        -d "${3}" \
-        "${NTFY_URL:-http://localhost:8123}/${NTFY_TOPIC:-updates}" >/dev/null 2>&1 || true
-}
+# Runs in a SUBSHELL -- note the ( ) rather than { } -- so nothing it reads can
+# leak into this script. It parses the file instead of sourcing it: `.` is
+# arbitrary code execution as root, and the trust argument is weakest exactly on
+# the restore path, where a zfs receive from a compromised backup host would
+# otherwise own this box at the next timer elapse. Every skip and failure says so
+# on stderr, which the timer captures: silence used to mean "no updates" and "the
+# token was revoked eleven months ago" indistinguishably, which is a poor property
+# for the channel whose whole job is telling you about updates.
+notify() (
+    if [ ! -r "$NOTIFY_ENV" ]; then
+        echo "check-update: no push: $NOTIFY_ENV is absent or unreadable" >&2
+        return 0
+    fi
+    local url topic token
+    url=$(grep -m1 -oP '^NTFY_URL=\K.*'   "$NOTIFY_ENV" 2>/dev/null || true)
+    topic=$(grep -m1 -oP '^NTFY_TOPIC=\K.*' "$NOTIFY_ENV" 2>/dev/null || true)
+    token=$(grep -m1 -oP '^NTFY_TOKEN=\K.*' "$NOTIFY_ENV" 2>/dev/null || true)
+    url="${url:-http://localhost:8123}"; topic="${topic:-updates}"
+    if [ -z "$token" ]; then
+        echo "check-update: no push: NTFY_TOKEN is empty in $NOTIFY_ENV" >&2
+        return 0
+    fi
+    # Token on stdin, not argv: /proc has no hidepid, so a command line would
+    # expose it to every local user for the duration of the request.
+    if ! printf 'Authorization: Bearer %s\n' "$token" |
+        curl -fsS --max-time 10 -H @- \
+            -H "Title: ${1}" -H "Tags: ${2}" -d "${3}" \
+            -o /dev/null "${url}/${topic}"; then
+        echo "check-update: ntfy push FAILED (token revoked? topic? url=$url)" >&2
+    fi
+    return 0
+)
 
 # Fetch the latest tag. This updates the local :latest pointer only; it does
 # NOT touch the running container.
@@ -90,8 +113,8 @@ if [ "$NTFY_TAG" != latest ]; then
     upstream=$(docker image inspect --format '{{.Id}}' docker.io/binwiederhier/ntfy:latest 2>/dev/null || true)
     if [ -n "$upstream" ] && [ "$upstream" != "$running" ]; then
         echo "note: pinned to $NTFY_TAG; upstream :latest has moved ($upstream)."
-        echo "      un-pin by removing NTFY_TAG from /tank/ntfy/image.env, then restart."
+        echo "      un-pin: remove /tank/ntfy/image.env, then re-run /opt/ntfy/install."
         notify "ntfy pin can likely be retired" "pushpin,ntfy" \
-            "Pinned to $NTFY_TAG; upstream :latest has moved. Un-pin: remove NTFY_TAG from /tank/ntfy/image.env, then sudo systemctl restart ntfy.service"
+            "Pinned to $NTFY_TAG; upstream :latest has moved. Un-pin: remove /tank/ntfy/image.env, then sudo /opt/ntfy/install"
     fi
 fi
